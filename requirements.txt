@@ -1,0 +1,7 @@
+rosbags==0.9.15
+numpy
+langgraph
+langchain
+langchain-core
+langchain-anthropic
+langchain-openai
