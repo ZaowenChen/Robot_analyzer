@@ -45,17 +45,17 @@ A neuro-symbolic diagnostic system that bridges the "reality gap" between roboti
 ### Prerequisites
 
 ```bash
-pip install -r rosbag_analyzer/requirements.txt
+pip install -r requirements.txt
 ```
 
 ### Run Standalone Analysis (No LLM Required)
 
 ```bash
 # Analyze all .bag files in the current directory
-python -m rosbag_analyzer.analyze
+python3 analyze.py
 
 # Specify a custom bag directory
-python -m rosbag_analyzer.analyze --bag-dir /path/to/bags
+python3 analyze.py --bag-dir /path/to/bags
 ```
 
 ### Run LangGraph Agent (Requires API Key)
@@ -64,20 +64,20 @@ python -m rosbag_analyzer.analyze --bag-dir /path/to/bags
 export ANTHROPIC_API_KEY="your-key-here"
 
 # Full agent validation against all bags
-python -m rosbag_analyzer.validate full
+python3 validate.py full
 ```
 
 ### Bridge Validation Only
 
 ```bash
 # Test that all 4 bridge tools work correctly
-python -m rosbag_analyzer.validate bridge_only
+python3 validate.py bridge_only
 ```
 
 ## Project Structure
 
 ```
-rosbag_analyzer/
+Robot_analyzer/
 ├── __init__.py              # Package init
 ├── rosbag_bridge.py         # Core Bridge — 4 tools, Welford's algorithm
 ├── tools.py                 # LangChain @tool wrappers

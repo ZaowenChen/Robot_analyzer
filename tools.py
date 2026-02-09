@@ -11,7 +11,10 @@ from typing import Optional
 
 from langchain_core.tools import tool
 
-from .rosbag_bridge import ROSBagBridge
+try:
+    from .rosbag_bridge import ROSBagBridge
+except ImportError:
+    from rosbag_bridge import ROSBagBridge
 
 # Singleton bridge instance
 _bridge = ROSBagBridge()

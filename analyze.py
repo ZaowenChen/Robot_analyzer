@@ -22,9 +22,15 @@ import argparse
 from collections import defaultdict
 from datetime import datetime, timezone
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(THIS_DIR) if os.path.basename(THIS_DIR) == "rosbag_analyzer" else THIS_DIR
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from rosbag_analyzer.rosbag_bridge import ROSBagBridge
+try:
+    from rosbag_analyzer.rosbag_bridge import ROSBagBridge
+except ModuleNotFoundError:
+    from rosbag_bridge import ROSBagBridge
 
 
 # Fields that are expected to be zero on a 2D differential-drive robot
@@ -415,7 +421,7 @@ class DiagnosticAnalyzer:
 
 def main():
     parser = argparse.ArgumentParser(description="Run rule-based diagnostics on .bag files.")
-    default_bag_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    default_bag_dir = PROJECT_ROOT
     parser.add_argument(
         "--bag-dir",
         default=default_bag_dir,

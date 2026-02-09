@@ -17,10 +17,15 @@ import sys
 import time
 from datetime import datetime
 
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(THIS_DIR) if os.path.basename(THIS_DIR) == "rosbag_analyzer" else THIS_DIR
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from rosbag_analyzer.rosbag_bridge import ROSBagBridge
+try:
+    from rosbag_analyzer.rosbag_bridge import ROSBagBridge
+except ModuleNotFoundError:
+    from rosbag_bridge import ROSBagBridge
 
 
 def run_bridge_validation(bag_path: str, bag_name: str) -> dict:
@@ -246,9 +251,35 @@ def run_bridge_validation(bag_path: str, bag_name: str) -> dict:
     return report
 
 
+def _has_llm_api_key() -> bool:
+    """Check if an LLM API key is available."""
+    return bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY"))
+
+
 def run_full_agent_validation(bag_path: str, bag_name: str) -> dict:
-    """Run the full LangGraph agent for autonomous diagnosis."""
-    from rosbag_analyzer.agent import run_diagnostic
+    """Run the full LangGraph agent for autonomous diagnosis.
+
+    Falls back to the rule-based DiagnosticAnalyzer when no LLM API key
+    is available, so ``validate.py full`` always produces results.
+    """
+    if not _has_llm_api_key():
+        print(f"\n{'='*70}")
+        print(f"NOTE: No LLM API key found (ANTHROPIC_API_KEY / OPENAI_API_KEY).")
+        print(f"Falling back to rule-based DiagnosticAnalyzer for: {bag_name}")
+        print(f"{'='*70}")
+        try:
+            from rosbag_analyzer.analyze import DiagnosticAnalyzer
+        except ModuleNotFoundError:
+            from analyze import DiagnosticAnalyzer
+
+        analyzer = DiagnosticAnalyzer()
+        report = analyzer.analyze(bag_path)
+        return report
+
+    try:
+        from rosbag_analyzer.agent import run_diagnostic
+    except ModuleNotFoundError:
+        from agent import run_diagnostic
 
     print(f"\n{'='*70}")
     print(f"AGENT VALIDATION: {bag_name}")
@@ -293,7 +324,7 @@ def run_full_agent_validation(bag_path: str, bag_name: str) -> dict:
 
 def main():
     """Main validation entry point."""
-    bag_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bag_dir = PROJECT_ROOT
     if not os.path.isdir(bag_dir):
         bag_dir = "/sessions/busy-nice-hamilton/mnt/robotic_test"
 
@@ -326,7 +357,7 @@ def main():
             all_reports.append(agent_report)
 
     # Save reports
-    report_path = os.path.join(bag_dir, "rosbag_analyzer", "validation_report.json")
+    report_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation_report.json")
     with open(report_path, "w") as f:
         json.dump(all_reports, f, indent=2, default=str)
     print(f"\n\nReport saved to: {report_path}")
