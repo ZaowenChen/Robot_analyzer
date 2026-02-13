@@ -264,7 +264,7 @@ class TruncatedBagReader:
                                         topic=rec_topic,
                                         msgtype=normalized_type,
                                         msgdef=rec_msgdef or '',
-                                        md5sum=rec_md5 or '',
+                                        digest=rec_md5 or '',
                                         msgcount=0,
                                         ext=ext,
                                         owner=None,
@@ -304,7 +304,7 @@ class TruncatedBagReader:
                 topic=conn.topic,
                 msgtype=conn.msgtype,
                 msgdef=conn.msgdef,
-                md5sum=conn.md5sum,
+                digest=conn.digest,
                 msgcount=count,
                 ext=conn.ext,
                 owner=None,
@@ -623,6 +623,38 @@ FIELD_EXTRACTORS = {
         "data": int(msg.data),
     },
 }
+
+
+def _extract_diagnostic_status(msg) -> Dict[str, float]:
+    """Extract numeric fields from a DiagnosticStatus message.
+
+    DiagnosticStatus uses key-value pairs rather than typed fields.
+    We extract:
+      - ``level`` (0=OK, 1=WARN, 2=ERROR, 3=STALE)
+      - Each key-value pair whose value is numeric → float
+      - Each key-value pair whose value is "true"/"false" → 1.0/0.0
+    This lets Welford's pipeline track transitions (e.g. a health flag
+    flipping from healthy to fault).
+    """
+    fields: Dict[str, float] = {"level": float(msg.level)}
+    for kv in msg.values:
+        key = kv.key
+        val = kv.value
+        # Boolean strings
+        if val.lower() == "true":
+            fields[key] = 1.0
+        elif val.lower() == "false":
+            fields[key] = 0.0
+        else:
+            # Try numeric
+            try:
+                fields[key] = float(val)
+            except (ValueError, TypeError):
+                pass
+    return fields
+
+
+FIELD_EXTRACTORS["diagnostic_msgs/msg/DiagnosticStatus"] = _extract_diagnostic_status
 
 
 def extract_fields(msg, msgtype: str) -> Optional[Dict[str, float]]:

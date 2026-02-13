@@ -35,6 +35,11 @@ EXPECTED_ZERO_FIELDS = {
               "twist_linear_y", "twist_linear_z"},
     "/chassis_cmd_vel": {"angular_x", "angular_y", "linear_y", "linear_z"},
     "/cmd_vel": {"angular_x", "angular_y", "linear_y", "linear_z"},
+    "/device/health_status": {"level"},
+    "/device/odom_status": {"level", "unicycle_angle_offset"},
+    "/device/imu_data": {"level", "stamp_sec", "stamp_nsec"},
+    "/device/scrubber_status": {"level"},
+    "/device/scrubber_motor_limit": {"level"},
 }
 
 # Topics worth checking for sensor-level anomalies
@@ -42,6 +47,29 @@ KEY_SENSOR_TOPICS = [
     "/odom", "/chassis_cmd_vel", "/cmd_vel",
     "/unbiased_imu_PRY", "/localization/current_pose",
 ]
+
+# Hardware topics (DiagnosticStatus-based and other hardware indicators)
+HARDWARE_TOPICS = [
+    "/device/health_status",
+    "/device/odom_status",
+    "/device/imu_data",
+    "/device/scrubber_status",
+    "/device/scrubber_motor_limit",
+    "/raw_scan", "/scan_rear",
+    "/ir_sticker3", "/ir_sticker6", "/ir_sticker7",
+    "/protector",
+    "/localization/status", "/navigation/status",
+]
+
+# Boolean health flags in /device/health_status where false (0.0) = fault
+HEALTH_FLAG_NAMES = {
+    "rear_rolling_brush_motor", "front_rolling_brush_motor",
+    "imu_board", "ultrasonic_board", "motor_driver",
+    "battery_disconnection", "mcu_disconnection", "mcu_delay",
+    "laser_disconnection", "router_disconnection", "tablet_disconnection",
+    "odom_left_delta", "odom_right_delta", "odom_delta_speed", "odom_track_delta",
+    "motor_driver_emergency", "imu_roll_pitch_abnormal", "imu_overturn",
+}
 
 
 def format_time(ts_sec):
@@ -250,6 +278,71 @@ def profile_and_slice_bag(bag_path, bridge=None):
                         "odom_max": odom_tlx.get("max"),
                     })
 
+        # -- 3e. Hardware health (DiagnosticStatus topics) --
+        hw_available = [t for t in HARDWARE_TOPICS if t in topic_map]
+        if hw_available:
+            print(f"\n  HARDWARE DIAGNOSTICS ({len(hw_available)} topics)...")
+
+            # Health flags from /device/health_status
+            if "/device/health_status" in topic_map:
+                stats = bridge.get_topic_statistics(bag_path, "/device/health_status")
+                if stats and "fields" in stats[0]:
+                    for field, s in stats[0]["fields"].items():
+                        if field not in HEALTH_FLAG_NAMES:
+                            continue
+                        if s["mean"] < 0.5 and s["count"] > 5:
+                            sensor_anomalies.append({
+                                "type": "HW_FAULT",
+                                "topic": "/device/health_status",
+                                "field": field,
+                                "mean": s["mean"],
+                                "count": s["count"],
+                            })
+
+            # IMU hardware data
+            if "/device/imu_data" in topic_map:
+                stats = bridge.get_topic_statistics(bag_path, "/device/imu_data")
+                if stats and "fields" in stats[0]:
+                    skip = EXPECTED_ZERO_FIELDS.get("/device/imu_data", set())
+                    for field, s in stats[0]["fields"].items():
+                        if field in skip:
+                            continue
+                        if s["std"] < 1e-6 and s["count"] > 10 and s["mean"] != 0.0:
+                            sensor_anomalies.append({
+                                "type": "IMU_HW_FROZEN",
+                                "field": field,
+                                "mean": s["mean"],
+                            })
+
+            # Lidar health
+            for lidar_topic in ["/raw_scan", "/scan_rear"]:
+                if lidar_topic not in topic_map:
+                    continue
+                stats = bridge.get_topic_statistics(bag_path, lidar_topic)
+                if stats and "fields" in stats[0]:
+                    valid = stats[0]["fields"].get("num_valid_points", {})
+                    if valid and valid.get("mean", 0) > 50:
+                        if valid.get("min", 0) < valid.get("mean", 0) * 0.3:
+                            sensor_anomalies.append({
+                                "type": "LIDAR_POINT_DROP",
+                                "topic": lidar_topic,
+                                "min_points": valid["min"],
+                                "mean_points": valid["mean"],
+                            })
+
+            # IR sticker dead sensors
+            for ir_topic in ["/ir_sticker3", "/ir_sticker6", "/ir_sticker7"]:
+                if ir_topic not in topic_map:
+                    continue
+                stats = bridge.get_topic_statistics(bag_path, ir_topic)
+                if stats and "fields" in stats[0]:
+                    data = stats[0]["fields"].get("data", {})
+                    if data and data.get("std", 0) < 1e-6 and data.get("mean", 0) == 0 and data.get("count", 0) > 10:
+                        sensor_anomalies.append({
+                            "type": "IR_SENSOR_DEAD",
+                            "topic": ir_topic,
+                        })
+
         result["sensor_anomalies"] = sensor_anomalies
 
         # -- Print sensor findings --
@@ -354,7 +447,8 @@ def profile_and_slice_bag(bag_path, bridge=None):
         # ==============================================================
         # STEP 5 – Health verdict
         # ==============================================================
-        critical_types = {"FROZEN_SENSOR", "CMD_ODOM_MISMATCH", "FREQ_DROPOUT"}
+        critical_types = {"FROZEN_SENSOR", "CMD_ODOM_MISMATCH", "FREQ_DROPOUT",
+                          "HW_FAULT", "LIDAR_POINT_DROP"}
         n_critical = sum(1 for a in sensor_anomalies
                          if a["type"] in critical_types)
         n_warn = sum(1 for a in sensor_anomalies
