@@ -40,6 +40,38 @@ EXPECTED_ZERO_FIELDS = {
               "twist_linear_y", "twist_linear_z"},
     "/chassis_cmd_vel": {"angular_x", "angular_y", "linear_y", "linear_z"},
     "/cmd_vel": {"angular_x", "angular_y", "linear_y", "linear_z"},
+    # DiagnosticStatus topics: 'level' is expected to be 0 (OK) when healthy
+    "/device/health_status": {"level"},
+    "/device/odom_status": {"level", "unicycle_angle_offset"},
+    "/device/imu_data": {"level", "stamp_sec", "stamp_nsec"},
+    "/device/scrubber_status": {"level"},
+    "/device/scrubber_motor_limit": {"level"},
+}
+
+# Hardware topics for Gaussian robot diagnostics
+HARDWARE_TOPICS = [
+    "/device/health_status",
+    "/device/odom_status",
+    "/device/imu_data",
+    "/device/scrubber_status",
+    "/device/scrubber_motor_limit",
+    "/raw_scan",
+    "/scan_rear",
+    "/ir_sticker3", "/ir_sticker6", "/ir_sticker7",
+    "/protector",
+    "/localization/status",
+    "/navigation/status",
+]
+
+# Health flags in /device/health_status where "false" (0.0) indicates a fault.
+# These are critical hardware subsystems to monitor.
+HEALTH_FLAG_NAMES = {
+    "rear_rolling_brush_motor", "front_rolling_brush_motor",
+    "imu_board", "ultrasonic_board", "motor_driver",
+    "battery_disconnection", "mcu_disconnection", "mcu_delay",
+    "laser_disconnection", "router_disconnection", "tablet_disconnection",
+    "odom_left_delta", "odom_right_delta", "odom_delta_speed", "odom_track_delta",
+    "motor_driver_emergency", "imu_roll_pitch_abnormal", "imu_overturn",
 }
 
 
@@ -212,6 +244,31 @@ class DiagnosticAnalyzer:
             print(f"\n--- Phase 7: Localization Consistency ---")
             self._check_localization(bag_path, global_stats, windowed_stats)
 
+        # ---- Phase 8: Hardware Health (DiagnosticStatus topics) ----
+        hw_available = [t for t in HARDWARE_TOPICS if t in topic_map]
+        if hw_available:
+            print(f"\n--- Phase 8: Hardware Health ({len(hw_available)} topics) ---")
+            self._check_hardware_health(bag_path, topic_map)
+
+        # ---- Phase 9: Lidar Health ----
+        lidar_topics = [t for t in ["/raw_scan", "/scan_rear"] if t in topic_map]
+        if lidar_topics:
+            print(f"\n--- Phase 9: Lidar Health ---")
+            self._check_lidar_health(bag_path, lidar_topics, end_time)
+
+        # ---- Phase 10: Scrubber Health ----
+        if "/device/scrubber_status" in topic_map:
+            print(f"\n--- Phase 10: Scrubber Health ---")
+            self._check_scrubber_health(bag_path, topic_map)
+
+        # ---- Phase 11: Safety Systems ----
+        safety_topics = [t for t in ["/protector", "/ir_sticker3", "/ir_sticker6",
+                                      "/ir_sticker7", "/localization/status",
+                                      "/navigation/status"] if t in topic_map]
+        if safety_topics:
+            print(f"\n--- Phase 11: Safety Systems ---")
+            self._check_safety_systems(bag_path, topic_map)
+
         # ---- Generate Report ----
         report = self._generate_report(bag_name, metadata)
         return report
@@ -346,6 +403,247 @@ class DiagnosticAnalyzer:
                             f"Odometry and localization ranges differ significantly "
                             f"(odom: {odom_range:.2f}m, loc: {loc_range:.2f}m, ratio: {ratio:.2f})",
                             {"odom_range": odom_range, "loc_range": loc_range})
+
+    # ------------------------------------------------------------------
+    # Phase 8: Hardware Health (DiagnosticStatus topics)
+    # ------------------------------------------------------------------
+    def _check_hardware_health(self, bag_path, topic_map):
+        """Analyse /device/* DiagnosticStatus topics for hardware faults."""
+
+        # --- 8a: /device/health_status — boolean health flags ---
+        if "/device/health_status" in topic_map:
+            print(f"\n  Checking /device/health_status...")
+            stats = self.bridge.get_topic_statistics(bag_path, "/device/health_status")
+            if stats and "fields" in stats[0]:
+                for field, s in stats[0]["fields"].items():
+                    if field in EXPECTED_ZERO_FIELDS.get("/device/health_status", set()):
+                        continue
+                    if field not in HEALTH_FLAG_NAMES:
+                        continue
+                    # value=0.0 means "false" = fault for boolean health flags
+                    if s["mean"] < 0.5 and s["count"] > 5:
+                        self.add_anomaly("CRITICAL", "HW_FAULT",
+                            f"/device/health_status.{field} reports FAULT "
+                            f"(mean={s['mean']:.2f}, {s['count']} msgs)",
+                            {"topic": "/device/health_status", "field": field,
+                             "mean": s["mean"]})
+                    else:
+                        self.add_evidence(f"HW health {field}: OK")
+
+            # Windowed: detect fault onset/recovery
+            wstats = self.bridge.get_topic_statistics(
+                bag_path, "/device/health_status", window_size=30.0)
+            if wstats:
+                for field in HEALTH_FLAG_NAMES:
+                    vals = [(w["window_start"],
+                             w["fields"].get(field, {}).get("mean", 1.0))
+                            for w in wstats if field in w.get("fields", {})]
+                    for i in range(1, len(vals)):
+                        prev_val, curr_val = vals[i-1][1], vals[i][1]
+                        if prev_val > 0.5 and curr_val < 0.5:
+                            self.add_anomaly("CRITICAL", "HW_FAULT_ONSET",
+                                f"{field} went to FAULT at t~{vals[i][0]:.1f}",
+                                {"field": field, "time": vals[i][0]})
+                        elif prev_val < 0.5 and curr_val > 0.5:
+                            self.add_anomaly("INFO", "HW_FAULT_RECOVERED",
+                                f"{field} recovered at t~{vals[i][0]:.1f}",
+                                {"field": field, "time": vals[i][0]})
+
+        # --- 8b: /device/odom_status — wheel encoder diagnostics ---
+        if "/device/odom_status" in topic_map:
+            print(f"\n  Checking /device/odom_status...")
+            stats = self.bridge.get_topic_statistics(bag_path, "/device/odom_status")
+            if stats and "fields" in stats[0]:
+                for field, s in stats[0]["fields"].items():
+                    if field in EXPECTED_ZERO_FIELDS.get("/device/odom_status", set()):
+                        continue
+                    # For odom error flags: "true" (1.0) = no error; "false" (0.0) = error
+                    if field.endswith("_error") or field == "is_gliding":
+                        if s["min"] < 0.5:
+                            self.add_anomaly("WARNING", "ODOM_HW_ERROR",
+                                f"/device/odom_status.{field} reported error "
+                                f"(min={s['min']:.0f}, mean={s['mean']:.2f})",
+                                {"field": field, "mean": s["mean"]})
+
+        # --- 8c: /device/imu_data — raw IMU via DiagnosticStatus ---
+        if "/device/imu_data" in topic_map:
+            print(f"\n  Checking /device/imu_data...")
+            stats = self.bridge.get_topic_statistics(bag_path, "/device/imu_data")
+            if stats and "fields" in stats[0]:
+                for field, s in stats[0]["fields"].items():
+                    if field in EXPECTED_ZERO_FIELDS.get("/device/imu_data", set()):
+                        continue
+                    if s["std"] < 1e-6 and s["count"] > 10:
+                        if s["mean"] == 0.0 and field.startswith("magnetic"):
+                            # Magnetometer may be disabled — info only
+                            self.add_anomaly("INFO", "IMU_HW_FIELD_ZERO",
+                                f"/device/imu_data.{field} always 0 (sensor may be disabled)",
+                                {"field": field})
+                        elif s["mean"] != 0.0:
+                            self.add_anomaly("WARNING", "IMU_HW_FROZEN",
+                                f"/device/imu_data.{field} frozen at {s['mean']:.1f}",
+                                {"field": field, "mean": s["mean"]})
+                    else:
+                        self.add_evidence(
+                            f"IMU HW {field}: mean={s['mean']:.1f} std={s['std']:.2f}")
+
+    # ------------------------------------------------------------------
+    # Phase 9: Lidar Health
+    # ------------------------------------------------------------------
+    def _check_lidar_health(self, bag_path, lidar_topics, end_time):
+        """Check laser scanners for point count drops and frequency issues."""
+        for topic in lidar_topics:
+            print(f"\n  Checking {topic}...")
+
+            # Global stats
+            stats = self.bridge.get_topic_statistics(bag_path, topic)
+            if not stats or "fields" not in stats[0]:
+                continue
+            fields = stats[0]["fields"]
+
+            valid = fields.get("num_valid_points", {})
+            total = fields.get("num_total_points", {})
+            if valid:
+                self.add_evidence(
+                    f"{topic} valid points: mean={valid.get('mean', 0):.0f} "
+                    f"min={valid.get('min', 0):.0f} max={valid.get('max', 0):.0f}")
+
+                # Severe drop in valid points
+                if valid.get("mean", 0) > 50 and valid.get("min", 0) < valid.get("mean", 0) * 0.3:
+                    self.add_anomaly("WARNING", "LIDAR_POINT_DROP",
+                        f"{topic} valid points dropped to {valid['min']:.0f} "
+                        f"(mean={valid['mean']:.0f})",
+                        {"topic": topic, "min_points": valid["min"],
+                         "mean_points": valid["mean"]})
+
+            # Windowed: detect point count degradation over time
+            wstats = self.bridge.get_topic_statistics(bag_path, topic, window_size=30.0)
+            if wstats:
+                for i in range(1, len(wstats)):
+                    prev_valid = wstats[i-1].get("fields", {}).get("num_valid_points", {})
+                    curr_valid = wstats[i].get("fields", {}).get("num_valid_points", {})
+                    prev_mean = prev_valid.get("mean", 0)
+                    curr_mean = curr_valid.get("mean", 0)
+                    if prev_mean > 50 and curr_mean < prev_mean * 0.3:
+                        self.add_anomaly("WARNING", "LIDAR_DEGRADATION",
+                            f"{topic} point count dropped from {prev_mean:.0f} to "
+                            f"{curr_mean:.0f} at t~{wstats[i]['window_start']:.1f}",
+                            {"topic": topic, "time": wstats[i]["window_start"]})
+
+            # Frequency check
+            freq = self.bridge.check_topic_frequency(bag_path, topic, resolution=5.0)
+            mean_hz = freq.get("mean_hz", 0)
+            self.add_evidence(f"{topic} frequency: {mean_hz:.1f} Hz")
+            series = freq.get("frequency_series", [])
+            for entry in series:
+                if mean_hz > 0 and entry["hz"] < mean_hz * 0.3:
+                    if entry["time"] < end_time - 10:
+                        self.add_anomaly("CRITICAL", "LIDAR_FREQ_DROPOUT",
+                            f"{topic} dropped to {entry['hz']:.1f}Hz "
+                            f"at t={entry['time']:.1f} (expected ~{mean_hz:.1f}Hz)",
+                            {"topic": topic, "time": entry["time"], "hz": entry["hz"]})
+
+    # ------------------------------------------------------------------
+    # Phase 10: Scrubber Health
+    # ------------------------------------------------------------------
+    def _check_scrubber_health(self, bag_path, topic_map):
+        """Check cleaning subsystem: brushes, water, valves."""
+        if "/device/scrubber_status" in topic_map:
+            print(f"\n  Checking /device/scrubber_status...")
+            stats = self.bridge.get_topic_statistics(bag_path, "/device/scrubber_status")
+            if stats and "fields" in stats[0]:
+                fields = stats[0]["fields"]
+
+                # Water level (0 = empty, higher = more)
+                water = fields.get("water_level", {})
+                if water and water.get("min", 99) == 0:
+                    self.add_anomaly("WARNING", "SCRUBBER_NO_WATER",
+                        f"Water level reached 0 during operation",
+                        {"min_level": water["min"], "mean_level": water.get("mean", 0)})
+
+                # Brush motor state
+                brush = fields.get("rolling_brush_motor", {})
+                if brush:
+                    self.add_evidence(
+                        f"Brush motor: mean={brush.get('mean', 0):.2f} "
+                        f"(1.0=on, 0.0=off)")
+
+                # Log key scrubber metrics
+                for key in ["brush_spin_level", "detergent_level", "valve"]:
+                    s = fields.get(key, {})
+                    if s:
+                        self.add_evidence(
+                            f"Scrubber {key}: mean={s.get('mean', 0):.2f}")
+
+        if "/device/scrubber_motor_limit" in topic_map:
+            print(f"\n  Checking /device/scrubber_motor_limit...")
+            stats = self.bridge.get_topic_statistics(bag_path, "/device/scrubber_motor_limit")
+            if stats and "fields" in stats[0]:
+                fields = stats[0]["fields"]
+                vel = fields.get("velocity_speed", {})
+                if vel:
+                    self.add_evidence(
+                        f"Scrubber motor velocity: mean={vel.get('mean', 0):.4f} "
+                        f"max={vel.get('max', 0):.4f}")
+
+    # ------------------------------------------------------------------
+    # Phase 11: Safety Systems
+    # ------------------------------------------------------------------
+    def _check_safety_systems(self, bag_path, topic_map):
+        """Check protector, IR stickers, localization/navigation status."""
+
+        # --- 11a: /protector — safety bumper string ---
+        if "/protector" in topic_map:
+            print(f"\n  Checking /protector...")
+            # /protector is std_msgs/String with data like "000000"
+            # Any '1' means a protector is triggered
+            samples = self.bridge.sample_messages(bag_path, "/protector", count=50)
+            triggered_count = 0
+            total_count = 0
+            for m in samples.get("messages", []):
+                total_count += 1
+                val = m.get("data", {}).get("data", "")
+                if isinstance(val, str) and "1" in val:
+                    triggered_count += 1
+
+            if triggered_count > 0:
+                self.add_anomaly("WARNING", "PROTECTOR_TRIGGERED",
+                    f"Protector triggered in {triggered_count}/{total_count} sampled messages",
+                    {"triggered": triggered_count, "sampled": total_count})
+            else:
+                self.add_evidence(f"Protector: clear ({total_count} samples)")
+
+        # --- 11b: IR stickers (cliff/proximity sensors) ---
+        for topic in ["/ir_sticker3", "/ir_sticker6", "/ir_sticker7"]:
+            if topic not in topic_map:
+                continue
+            stats = self.bridge.get_topic_statistics(bag_path, topic)
+            if not stats or "fields" not in stats[0]:
+                continue
+            data = stats[0]["fields"].get("data", {})
+            if data:
+                self.add_evidence(
+                    f"{topic}: mean={data.get('mean', 0):.2f} "
+                    f"range=[{data.get('min', 0):.2f}, {data.get('max', 0):.2f}]")
+                # All-zero IR may mean sensor disconnected
+                if data.get("std", 0) < 1e-6 and data.get("mean", 0) == 0 and data.get("count", 0) > 10:
+                    self.add_anomaly("WARNING", "IR_SENSOR_DEAD",
+                        f"{topic} always 0.0 — sensor may be disconnected",
+                        {"topic": topic})
+
+        # --- 11c: Localization & navigation status ---
+        for topic, label in [("/localization/status", "Localization"),
+                              ("/navigation/status", "Navigation")]:
+            if topic not in topic_map:
+                continue
+            stats = self.bridge.get_topic_statistics(bag_path, topic)
+            if not stats or "fields" not in stats[0]:
+                continue
+            data = stats[0]["fields"].get("data", {})
+            if data:
+                self.add_evidence(
+                    f"{label} status: mean={data.get('mean', 0):.1f} "
+                    f"range=[{data.get('min', 0):.0f}, {data.get('max', 0):.0f}]")
 
     def _generate_report(self, bag_name: str, metadata: dict) -> dict:
         """Generate the final diagnostic report."""

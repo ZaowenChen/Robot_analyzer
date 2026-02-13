@@ -36,6 +36,20 @@ DIAGNOSTIC WORKFLOW:
 4. Use windowed statistics to localize anomalies in time.
 5. Sample raw messages around anomalous timestamps.
 
+HARDWARE DIAGNOSTICS (Gaussian robot specific):
+6. Check `/device/health_status` — DiagnosticStatus with boolean health flags.
+   Each key-value has value "true" (healthy) or "false" (fault). Key flags:
+   rear_rolling_brush_motor, front_rolling_brush_motor, imu_board, ultrasonic_board,
+   motor_driver, battery_disconnection, mcu_disconnection, laser_disconnection,
+   motor_driver_emergency, imu_roll_pitch_abnormal, imu_overturn.
+   Use get_topic_statistics: mean < 0.5 on a flag means fault occurred.
+7. Check `/device/odom_status` for wheel encoder errors (odom_left_delta_error, is_gliding).
+8. Check `/device/imu_data` for raw IMU readings — frozen yaw_angle or zero magnetometer.
+9. Check `/raw_scan` and `/scan_rear` (LaserScan) for num_valid_points drops.
+10. Check `/device/scrubber_status` for water_level, brush motor state.
+11. Check `/ir_sticker3/6/7` (Float32 proximity sensors) — all-zero means disconnected.
+12. Check `/protector` (String "000000") — any "1" bit means safety protector triggered.
+
 Current Evidence:
 {evidence}
 

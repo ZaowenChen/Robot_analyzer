@@ -264,7 +264,7 @@ class TruncatedBagReader:
                                         topic=rec_topic,
                                         msgtype=normalized_type,
                                         msgdef=rec_msgdef or '',
-                                        md5sum=rec_md5 or '',
+                                        digest=rec_md5 or '',
                                         msgcount=0,
                                         ext=ext,
                                         owner=None,
@@ -304,7 +304,7 @@ class TruncatedBagReader:
                 topic=conn.topic,
                 msgtype=conn.msgtype,
                 msgdef=conn.msgdef,
-                md5sum=conn.md5sum,
+                digest=conn.digest,
                 msgcount=count,
                 ext=conn.ext,
                 owner=None,
@@ -625,6 +625,38 @@ FIELD_EXTRACTORS = {
 }
 
 
+def _extract_diagnostic_status(msg) -> Dict[str, float]:
+    """Extract numeric fields from a DiagnosticStatus message.
+
+    DiagnosticStatus uses key-value pairs rather than typed fields.
+    We extract:
+      - ``level`` (0=OK, 1=WARN, 2=ERROR, 3=STALE)
+      - Each key-value pair whose value is numeric → float
+      - Each key-value pair whose value is "true"/"false" → 1.0/0.0
+    This lets Welford's pipeline track transitions (e.g. a health flag
+    flipping from healthy to fault).
+    """
+    fields: Dict[str, float] = {"level": float(msg.level)}
+    for kv in msg.values:
+        key = kv.key
+        val = kv.value
+        # Boolean strings
+        if val.lower() == "true":
+            fields[key] = 1.0
+        elif val.lower() == "false":
+            fields[key] = 0.0
+        else:
+            # Try numeric
+            try:
+                fields[key] = float(val)
+            except (ValueError, TypeError):
+                pass
+    return fields
+
+
+FIELD_EXTRACTORS["diagnostic_msgs/msg/DiagnosticStatus"] = _extract_diagnostic_status
+
+
 def extract_fields(msg, msgtype: str) -> Optional[Dict[str, float]]:
     """Extract numeric fields from a deserialized message."""
     if msgtype in FIELD_EXTRACTORS:
@@ -702,6 +734,47 @@ class ROSBagBridge:
         self._type_registry = set()
         # Types that are known to fail deserialization (custom types)
         self._skip_types = set()
+        # Cache for open readers – avoids re-scanning truncated bags on
+        # every tool call.  Keyed by the *resolved* absolute path so that
+        # relative and absolute references hit the same entry.
+        self._reader_cache: Dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    # Reader cache helpers
+    # ------------------------------------------------------------------
+    def _get_reader(self, bag_path: str):
+        """Return a (possibly cached) reader for *bag_path*.
+
+        For ``TruncatedBagReader`` instances the expensive byte-scan only
+        happens once; subsequent calls reuse the cached object.  Normal
+        ``Reader`` instances from *rosbags* are also cached so the index
+        parsing is not repeated.
+        """
+        key = os.path.realpath(bag_path)
+        if key not in self._reader_cache:
+            reader = open_bag(bag_path)
+            self._reader_cache[key] = reader
+        return self._reader_cache[key]
+
+    class _CachedReaderCtx:
+        """Thin context-manager wrapper that does NOT close the reader."""
+        def __init__(self, reader):
+            self.reader = reader
+        def __enter__(self):
+            return self.reader
+        def __exit__(self, *args):
+            pass  # keep alive in cache – do not close
+        # Forward attribute access so callers can use the wrapper directly
+        def __getattr__(self, name):
+            return getattr(self.reader, name)
+
+    def _open_cached(self, bag_path: str):
+        """Return a context-manager over the cached reader.
+
+        Unlike ``open_bag()`` this will NOT close the reader on exit so
+        it stays available for the next tool call.
+        """
+        return self._CachedReaderCtx(self._get_reader(bag_path))
 
     def _try_deserialize(self, rawdata: bytes, msgtype: str):
         """Attempt to deserialize a ROS1 message, handling custom types gracefully."""
@@ -721,7 +794,7 @@ class ROSBagBridge:
         Initial reconnaissance. Returns bag duration, time range, and
         topic inventory with message counts and estimated frequencies.
         """
-        with open_bag(bag_path) as reader:
+        with self._open_cached(bag_path) as reader:
             duration = reader.duration / 1e9  # nanoseconds to seconds
             start_time = reader.start_time / 1e9
             end_time = reader.end_time / 1e9
@@ -780,7 +853,7 @@ class ROSBagBridge:
 
         Uses Welford's algorithm for O(1) memory.
         """
-        with open_bag(bag_path) as reader:
+        with self._open_cached(bag_path) as reader:
             bag_start = reader.start_time / 1e9
             bag_end = reader.end_time / 1e9
 
@@ -865,7 +938,7 @@ class ROSBagBridge:
         Compute a time-series of message frequency (Hz) at the given resolution.
         Useful for detecting silent failures like packet loss or driver crashes.
         """
-        with open_bag(bag_path) as reader:
+        with self._open_cached(bag_path) as reader:
             connections = [c for c in reader.connections if c.topic == topic_name]
             if not connections:
                 return {"error": f"Topic '{topic_name}' not found"}
@@ -929,7 +1002,7 @@ class ROSBagBridge:
         Return raw JSON deserialization of messages for qualitative inspection.
         If timestamp is given, returns messages closest to that time.
         """
-        with open_bag(bag_path) as reader:
+        with self._open_cached(bag_path) as reader:
             connections = [c for c in reader.connections if c.topic == topic_name]
             if not connections:
                 return {"error": f"Topic '{topic_name}' not found"}
