@@ -29,11 +29,11 @@ from langchain_core.messages import (
 from langgraph.graph import END, StateGraph
 
 try:
-    from .prompt_templates import SYSTEM_PROMPT
+    from .prompt_templates import SYSTEM_PROMPT, CRITIC_PROMPT
     from .rosbag_bridge import ROSBagBridge
     from .tools import ALL_TOOLS
 except ImportError:
-    from prompt_templates import SYSTEM_PROMPT
+    from prompt_templates import SYSTEM_PROMPT, CRITIC_PROMPT
     from rosbag_bridge import ROSBagBridge
     from tools import ALL_TOOLS
 
@@ -219,6 +219,43 @@ def tool_executor_node(state: AgentState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Critic Node (Section 4 of the Diagnostic Agent Plan)
+# ---------------------------------------------------------------------------
+def critic_node(state: AgentState, llm) -> dict:
+    """
+    The Critic verifies the Supervisor's diagnosis against the Evidence Locker.
+
+    If the evidence is sufficient and well-grounded the Critic responds with
+    APPROVED and the graph ends.  Otherwise it sends feedback back to the
+    Supervisor for another investigation round.
+    """
+    evidence_str = (
+        "\n".join(f"  - {e}" for e in state.get("evidence", []))
+        or "  (none)"
+    )
+    critic_prompt = CRITIC_PROMPT.format(evidence=evidence_str)
+
+    # The last AI message contains the proposed diagnosis
+    diagnosis_msg = ""
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, AIMessage) and msg.content:
+            diagnosis_msg = msg.content
+            break
+
+    messages = [
+        SystemMessage(content=critic_prompt),
+        HumanMessage(content=f"Here is the agent's proposed diagnosis:\n\n{diagnosis_msg}"),
+    ]
+
+    response = llm.invoke(messages)
+
+    return {
+        "messages": [response],
+        "steps": state.get("steps", 0) + 1,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Routing Logic
 # ---------------------------------------------------------------------------
 def route_supervisor(state: AgentState) -> str:
@@ -233,8 +270,25 @@ def route_supervisor(state: AgentState) -> str:
     if state.get("steps", 0) >= 15:
         return END
 
-    # LLM is done (no tool calls = final answer)
-    return END
+    # LLM is done (no tool calls = final answer) – route to Critic for review
+    return "critic"
+
+
+def route_critic(state: AgentState) -> str:
+    """Determine whether the Critic approves or sends back for more work."""
+    last_msg = state["messages"][-1]
+
+    # Safety: if we've run too many steps, end regardless
+    if state.get("steps", 0) >= 15:
+        return END
+
+    if isinstance(last_msg, AIMessage) and last_msg.content:
+        text_upper = last_msg.content.upper()
+        if "APPROVED" in text_upper:
+            return END
+
+    # Critic rejected – send back to supervisor for more investigation
+    return "supervisor"
 
 
 # ---------------------------------------------------------------------------
@@ -244,8 +298,10 @@ def build_diagnostic_graph(llm):
     """
     Construct the LangGraph diagnostic workflow.
 
-    Graph structure:
-      supervisor -> (tool_calls?) -> tool_executor -> supervisor -> ... -> END
+    Graph structure (per the project plan):
+      supervisor -> (tool_calls?) -> tool_executor -> supervisor
+                 -> (no tool_calls) -> critic -> (APPROVED?) -> END
+                                              -> (rejected)  -> supervisor
     """
     # Bind tools to LLM
     llm_with_tools = llm.bind_tools(ALL_TOOLS)
@@ -254,16 +310,22 @@ def build_diagnostic_graph(llm):
     def supervisor_fn(state):
         return supervisor_node(state, llm_with_tools)
 
+    # Create critic with the base LLM (no tools needed for review)
+    def critic_fn(state):
+        return critic_node(state, llm)
+
     # Build graph
     workflow = StateGraph(AgentState)
 
     workflow.add_node("supervisor", supervisor_fn)
     workflow.add_node("tool_executor", tool_executor_node)
+    workflow.add_node("critic", critic_fn)
 
     workflow.set_entry_point("supervisor")
 
     workflow.add_conditional_edges("supervisor", route_supervisor)
     workflow.add_edge("tool_executor", "supervisor")
+    workflow.add_conditional_edges("critic", route_critic)
 
     return workflow.compile()
 
@@ -287,6 +349,12 @@ def run_diagnostic(
         dict with diagnosis, evidence, and step count
     """
     if llm is None:
+        import os as _os
+        # Ensure the system CA bundle is available for proxy environments
+        _ca_bundle = "/etc/ssl/certs/ca-certificates.crt"
+        if _os.path.exists(_ca_bundle):
+            _os.environ.setdefault("SSL_CERT_FILE", _ca_bundle)
+            _os.environ.setdefault("REQUESTS_CA_BUNDLE", _ca_bundle)
         try:
             from langchain_anthropic import ChatAnthropic
             llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0)
@@ -312,8 +380,11 @@ def run_diagnostic(
         print(f"Query: {query}")
         print(f"{'='*70}\n")
 
-    # Stream events for visibility
-    final_state = None
+    # Invoke once and collect streamed events for verbose output
+    result_state = None
+    all_messages = list(initial_state["messages"])
+    all_evidence = list(initial_state["evidence"])
+
     for event in app.stream(initial_state, {"recursion_limit": 30}):
         for node_name, state_update in event.items():
             if verbose:
@@ -333,29 +404,26 @@ def run_diagnostic(
                 new_evidence = state_update.get("evidence", [])
                 if new_evidence:
                     print(f"  New Evidence: {new_evidence}")
-            final_state = state_update
+
+            # Accumulate state
+            all_messages.extend(state_update.get("messages", []))
+            all_evidence.extend(state_update.get("evidence", []))
+            result_state = state_update
 
     # Extract final diagnosis from last AI message
     diagnosis = ""
-    all_messages = initial_state["messages"]
-    # Collect all messages from stream events
-    for event in app.stream(initial_state, {"recursion_limit": 30}):
-        pass
-
-    # Get the complete state by invoking
-    result_state = app.invoke(initial_state, {"recursion_limit": 30})
-
-    # Find the last AI message for diagnosis
-    for msg in reversed(result_state["messages"]):
+    for msg in reversed(all_messages):
         if isinstance(msg, AIMessage) and msg.content:
             diagnosis = msg.content
             break
 
+    total_steps = result_state.get("steps", 0) if result_state else 0
+
     return {
         "diagnosis": diagnosis,
-        "evidence": result_state.get("evidence", []),
-        "steps": result_state.get("steps", 0),
+        "evidence": all_evidence,
+        "steps": total_steps,
         "num_tool_calls": sum(
-            1 for m in result_state["messages"] if isinstance(m, ToolMessage)
+            1 for m in all_messages if isinstance(m, ToolMessage)
         ),
     }

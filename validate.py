@@ -256,6 +256,109 @@ def _has_llm_api_key() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY"))
 
 
+# ---------------------------------------------------------------------------
+# Hallucination Rate (Section 3.5.3 of the Diagnostic Agent Plan)
+# ---------------------------------------------------------------------------
+_FACT_CHECK_PROMPT = """\
+You are a strict Fact-Checker for robotic diagnostic reports.
+
+You are given:
+1. A DIAGNOSIS produced by a diagnostic agent.
+2. An EVIDENCE LOCKER – a list of factual observations extracted by
+   programmatic tools from a ROS bag.
+
+Your task:
+- Extract every distinct factual claim from the DIAGNOSIS (a "claim" is any
+  statement about sensor values, frequencies, anomalies, timestamps, topic
+  names, or statistical results).
+- For each claim, determine whether it is SUPPORTED or UNSUPPORTED by the
+  evidence locker.  A claim is SUPPORTED only if there is a matching or
+  clearly entailed item in the evidence.
+- Respond with EXACTLY this JSON format – no commentary before or after:
+
+{{
+  "claims": [
+    {{"claim": "<text of claim>", "supported": true}},
+    {{"claim": "<text of claim>", "supported": false}}
+  ]
+}}
+"""
+
+
+def compute_hallucination_rate(
+    diagnosis: str,
+    evidence: list,
+    llm=None,
+) -> dict:
+    """Compute the Hallucination Rate H_r for a diagnosis.
+
+    H_r = (number of unsupported claims) / (total claims).
+
+    Uses an LLM call to decompose the diagnosis into claims and check each
+    against the evidence locker.  Returns a dict with ``hallucination_rate``,
+    ``total_claims``, ``unsupported_claims``, and the raw ``claims`` list.
+    """
+    if not diagnosis or not evidence:
+        return {
+            "hallucination_rate": 0.0,
+            "total_claims": 0,
+            "unsupported_claims": 0,
+            "claims": [],
+        }
+
+    if llm is None:
+        # Ensure the system CA bundle is available for proxy environments
+        _ca_bundle = "/etc/ssl/certs/ca-certificates.crt"
+        if os.path.exists(_ca_bundle):
+            os.environ.setdefault("SSL_CERT_FILE", _ca_bundle)
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", _ca_bundle)
+        try:
+            from langchain_anthropic import ChatAnthropic
+            llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0)
+        except Exception:
+            from langchain_openai import ChatOpenAI
+            llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+    from langchain_core.messages import SystemMessage, HumanMessage
+
+    evidence_str = "\n".join(f"  - {e}" for e in evidence)
+    user_msg = (
+        f"DIAGNOSIS:\n{diagnosis}\n\n"
+        f"EVIDENCE LOCKER:\n{evidence_str}"
+    )
+
+    response = llm.invoke([
+        SystemMessage(content=_FACT_CHECK_PROMPT),
+        HumanMessage(content=user_msg),
+    ])
+
+    # Parse the JSON response
+    import re
+    text = response.content if hasattr(response, "content") else str(response)
+
+    # Try to extract JSON from the response
+    json_match = re.search(r'\{[\s\S]*\}', text)
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group())
+            claims = parsed.get("claims", [])
+        except json.JSONDecodeError:
+            claims = []
+    else:
+        claims = []
+
+    total = len(claims)
+    unsupported = sum(1 for c in claims if not c.get("supported", True))
+    rate = unsupported / total if total > 0 else 0.0
+
+    return {
+        "hallucination_rate": round(rate, 4),
+        "total_claims": total,
+        "unsupported_claims": unsupported,
+        "claims": claims,
+    }
+
+
 def run_full_agent_validation(bag_path: str, bag_name: str) -> dict:
     """Run the full LangGraph agent for autonomous diagnosis.
 
@@ -299,6 +402,13 @@ def run_full_agent_validation(bag_path: str, bag_name: str) -> dict:
     # Compute Grounding Ratio
     grounding_ratio = result["num_tool_calls"] / max(result["steps"], 1)
 
+    # ---- Hallucination Rate (Section 3.5.3) ----
+    print(f"\n  Computing Hallucination Rate (H_r)...")
+    hr_result = compute_hallucination_rate(
+        result["diagnosis"],
+        result["evidence"],
+    )
+
     print(f"\n{'='*70}")
     print(f"AGENT RESULTS: {bag_name}")
     print(f"{'='*70}")
@@ -306,9 +416,17 @@ def run_full_agent_validation(bag_path: str, bag_name: str) -> dict:
     print(f"  Tool Calls: {result['num_tool_calls']}")
     print(f"  Grounding Ratio: {grounding_ratio:.2f}")
     print(f"  Evidence items: {len(result['evidence'])}")
+    print(f"  Hallucination Rate (H_r): {hr_result['hallucination_rate']:.2%}"
+          f"  ({hr_result['unsupported_claims']}/{hr_result['total_claims']} unsupported)")
     print(f"\n  Evidence Locker:")
     for e in result["evidence"]:
         print(f"    - {e}")
+    if hr_result["claims"]:
+        unsupported = [c for c in hr_result["claims"] if not c.get("supported")]
+        if unsupported:
+            print(f"\n  Unsupported Claims:")
+            for c in unsupported:
+                print(f"    - {c['claim']}")
     print(f"\n  Diagnosis (first 1000 chars):")
     print(f"    {result['diagnosis'][:1000]}")
 
@@ -317,6 +435,8 @@ def run_full_agent_validation(bag_path: str, bag_name: str) -> dict:
         "steps": result["steps"],
         "tool_calls": result["num_tool_calls"],
         "grounding_ratio": grounding_ratio,
+        "hallucination_rate": hr_result["hallucination_rate"],
+        "hallucination_detail": hr_result,
         "evidence": result["evidence"],
         "diagnosis": result["diagnosis"],
     }
