@@ -1,5 +1,5 @@
 """
-Standalone Diagnostic Analyzer
+Standalone Diagnostic Analyzer (v2.0 — Mission-Aware)
 
 This performs a comprehensive, rule-based diagnostic analysis of rosbag files
 using the Bridge tools. It implements the same diagnostic logic that the
@@ -12,15 +12,26 @@ This serves as:
 
 The analyzer follows the hierarchical zooming workflow from the project plan:
   Level 1 (Global) -> Level 2 (Regional) -> Level 3 (Local)
+
+v2.0 additions:
+  - Mission-aware multi-bag virtual timeline (--mode mission)
+  - /rosout log extraction and correlation with sensor anomalies
+  - Absolute timestamps (CST, UTC+8)
+  - Cross-bag anomaly detection (persistent freezes, hardware faults)
+  - CSV timeline export (--csv)
+  - Backward-compatible legacy mode (--mode legacy)
 """
 
+import csv
 import json
 import os
 import sys
 import time
 import argparse
 from collections import defaultdict
-from datetime import datetime, timezone
+from dataclasses import dataclass, field as dataclass_field
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Optional
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(THIS_DIR) if os.path.basename(THIS_DIR) == "rosbag_analyzer" else THIS_DIR
@@ -28,10 +39,21 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 try:
-    from rosbag_analyzer.rosbag_bridge import ROSBagBridge
+    from rosbag_analyzer.rosbag_bridge import ROSBagBridge, LOG_LEVELS
 except ModuleNotFoundError:
-    from rosbag_bridge import ROSBagBridge
+    from rosbag_bridge import ROSBagBridge, LOG_LEVELS
 
+from rosbags.serde import deserialize_cdr, ros1_to_cdr
+
+
+# ---------- Constants ----------
+
+# China Standard Time (UTC+8)
+CST = timezone(timedelta(hours=8))
+
+# Maximum gap (seconds) between end of one bag and start of next
+# to consider them part of the same mission
+MISSION_GAP_THRESHOLD = 300  # 5 minutes
 
 # Fields that are expected to be zero on a 2D differential-drive robot
 EXPECTED_ZERO_FIELDS = {
@@ -75,6 +97,18 @@ HEALTH_FLAG_NAMES = {
 }
 
 
+# ---------- Helpers ----------
+
+def format_absolute_time(unix_sec: float) -> str:
+    """Convert Unix epoch seconds to human-readable datetime string (CST)."""
+    dt = datetime.fromtimestamp(unix_sec, tz=CST)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]  # millisecond precision
+
+
+# ======================================================================
+# DiagnosticAnalyzer — per-bag analysis (11 phases + /rosout)
+# ======================================================================
+
 class DiagnosticAnalyzer:
     """
     Rule-based diagnostic analyzer implementing the project plan's
@@ -85,28 +119,69 @@ class DiagnosticAnalyzer:
         self.bridge = ROSBagBridge()
         self.evidence = []
         self.anomalies = []
+        self.log_events = []
         self.warnings = []
 
     def add_evidence(self, finding: str):
         self.evidence.append(finding)
         print(f"    [EVIDENCE] {finding}")
 
-    def add_anomaly(self, severity: str, category: str, description: str, details: dict = None):
+    def add_anomaly(self, severity: str, category: str, description: str,
+                    details: dict = None, timestamp: float = None):
         anomaly = {
             "severity": severity,
             "category": category,
             "description": description,
             "details": details or {},
         }
+        if timestamp is not None:
+            anomaly["timestamp"] = timestamp
+            anomaly["timestamp_str"] = format_absolute_time(timestamp)
         self.anomalies.append(anomaly)
         icon = {"CRITICAL": "!!!", "WARNING": "!!", "INFO": "!"}[severity]
         print(f"    [{icon} {severity}] {category}: {description}")
+
+    # ------------------------------------------------------------------
+    # Phase 1.5: /rosout log extraction
+    # ------------------------------------------------------------------
+    def _scan_rosout_logs(self, bag_path: str) -> list:
+        """Scan /rosout and /rosout_agg for WARN/ERROR/FATAL messages."""
+        log_events = []
+        try:
+            with self.bridge._open_cached(bag_path) as reader:
+                log_conns = [c for c in reader.connections
+                             if c.topic in ['/rosout', '/rosout_agg']]
+                if not log_conns:
+                    return log_events
+
+                for conn, ts_ns, rawdata in reader.messages(connections=log_conns):
+                    try:
+                        msg = deserialize_cdr(
+                            ros1_to_cdr(rawdata, conn.msgtype), conn.msgtype)
+                        if hasattr(msg, 'level') and msg.level >= 4:  # WARN+
+                            log_events.append({
+                                "timestamp": ts_ns / 1e9,
+                                "timestamp_str": format_absolute_time(ts_ns / 1e9),
+                                "level": int(msg.level),
+                                "level_str": LOG_LEVELS.get(msg.level, f"LVL{msg.level}"),
+                                "node": str(getattr(msg, 'name', '')),
+                                "message": str(getattr(msg, 'msg', '')),
+                                "topic": conn.topic,
+                            })
+                    except Exception:
+                        continue
+        except Exception as e:
+            print(f"    [WARN] Could not scan /rosout: {e}")
+
+        log_events.sort(key=lambda ev: ev["timestamp"])
+        return log_events
 
     def analyze(self, bag_path: str) -> dict:
         """Run complete diagnostic analysis on a bag file."""
         bag_name = os.path.basename(bag_path)
         self.evidence = []
         self.anomalies = []
+        self.log_events = []
 
         print(f"\n{'='*70}")
         print(f"COMPREHENSIVE DIAGNOSTIC ANALYSIS")
@@ -119,7 +194,7 @@ class DiagnosticAnalyzer:
         metadata = self.bridge.get_bag_metadata(bag_path)
         elapsed = time.time() - t0
         print(f"  Duration: {metadata['duration']:.2f}s")
-        print(f"  Time range: {metadata['start_time']:.4f} to {metadata['end_time']:.4f}")
+        print(f"  Time range: {format_absolute_time(metadata['start_time'])} to {format_absolute_time(metadata['end_time'])}")
         print(f"  Topics: {metadata['num_topics']}, Messages: {metadata['total_messages']}")
         print(f"  (took {elapsed:.2f}s)")
 
@@ -130,6 +205,19 @@ class DiagnosticAnalyzer:
         # Categorize topics
         topic_map = {t["name"]: t for t in metadata["topics"]}
         self.add_evidence(f"Bag: {bag_name}, duration={duration:.1f}s, {metadata['num_topics']} topics")
+
+        # ---- Phase 1.5: /rosout Log Extraction ----
+        print(f"\n--- Phase 1.5: /rosout Log Extraction ---")
+        t0 = time.time()
+        self.log_events = self._scan_rosout_logs(bag_path)
+        elapsed = time.time() - t0
+        print(f"  Found {len(self.log_events)} WARN/ERROR/FATAL log messages (took {elapsed:.2f}s)")
+        if self.log_events:
+            for ev in self.log_events[:5]:
+                print(f"    [{ev['timestamp_str']}] {ev['level_str']:<5} [{ev['node']}]: "
+                      f"{ev['message'][:100]}")
+            if len(self.log_events) > 5:
+                print(f"    ... and {len(self.log_events) - 5} more")
 
         # ---- Phase 2: Global Statistics (Level 1) ----
         print(f"\n--- Phase 2: Global Statistics (Level 1 - Whole Bag) ---")
@@ -187,17 +275,21 @@ class DiagnosticAnalyzer:
                     prev_std = stds[i-1][1]
                     curr_std = stds[i][1]
                     if prev_std > 0.001 and curr_std < 1e-6:
+                        ts = stds[i][0]
                         self.add_anomaly("WARNING", "FREEZE_ONSET",
-                            f"{topic}.{field} froze at t~{stds[i][0]:.1f} "
+                            f"{topic}.{field} froze at {format_absolute_time(ts)} "
                             f"(std went from {prev_std:.6f} to {curr_std:.6f}, "
                             f"value={stds[i][2]:.6f})",
-                            {"topic": topic, "field": field, "time": stds[i][0]})
+                            {"topic": topic, "field": field, "time": ts},
+                            timestamp=ts)
 
                     # Detect resume: std transitions from ~0 to >0
                     if prev_std < 1e-6 and curr_std > 0.001 and stds[i-1][2] != 0:
+                        ts = stds[i][0]
                         self.add_anomaly("INFO", "SENSOR_RESUME",
-                            f"{topic}.{field} resumed at t~{stds[i][0]:.1f}",
-                            {"topic": topic, "field": field, "time": stds[i][0]})
+                            f"{topic}.{field} resumed at {format_absolute_time(ts)}",
+                            {"topic": topic, "field": field, "time": ts},
+                            timestamp=ts)
 
         # ---- Phase 4: Frequency Analysis ----
         print(f"\n--- Phase 4: Frequency Analysis ---")
@@ -219,10 +311,12 @@ class DiagnosticAnalyzer:
                 if mean_hz > 0 and entry["hz"] < mean_hz * 0.3:
                     # Exclude the very last bin (bag ending)
                     if entry["time"] < end_time - 10:
+                        ts = entry["time"]
                         self.add_anomaly("CRITICAL", "FREQUENCY_DROPOUT",
-                            f"{topic} dropped to {entry['hz']:.1f}Hz at t={entry['time']:.1f} "
+                            f"{topic} dropped to {entry['hz']:.1f}Hz at {format_absolute_time(ts)} "
                             f"(expected ~{mean_hz:.1f}Hz)",
-                            {"topic": topic, "time": entry["time"], "hz": entry["hz"]})
+                            {"topic": topic, "time": ts, "hz": entry["hz"]},
+                            timestamp=ts)
 
             # Overall frequency stability
             if mean_hz > 0 and std_hz > mean_hz * 0.2:
@@ -321,12 +415,14 @@ class DiagnosticAnalyzer:
 
                 # Command sent but no motion in this window
                 if cmd_lx.get("mean", 0) > 0.05 and odom_tlx.get("std", 0) < 1e-6:
+                    ts = cw["window_start"]
                     self.add_anomaly("WARNING", "STALL_DETECTED",
                         f"Commands active but odom frozen in window "
-                        f"[{cw['window_start']:.1f}, {cw['window_end']:.1f}]",
-                        {"window_start": cw["window_start"],
+                        f"[{format_absolute_time(ts)}, {format_absolute_time(cw['window_end'])}]",
+                        {"window_start": ts,
                          "cmd_mean": cmd_lx.get("mean"),
-                         "odom_std": odom_tlx.get("std")})
+                         "odom_std": odom_tlx.get("std")},
+                        timestamp=ts)
 
     def _check_imu_health(self, bag_path, global_stats, windowed_stats):
         """Check IMU for frozen axes or anomalous behavior."""
@@ -440,14 +536,17 @@ class DiagnosticAnalyzer:
                             for w in wstats if field in w.get("fields", {})]
                     for i in range(1, len(vals)):
                         prev_val, curr_val = vals[i-1][1], vals[i][1]
+                        ts = vals[i][0]
                         if prev_val > 0.5 and curr_val < 0.5:
                             self.add_anomaly("CRITICAL", "HW_FAULT_ONSET",
-                                f"{field} went to FAULT at t~{vals[i][0]:.1f}",
-                                {"field": field, "time": vals[i][0]})
+                                f"{field} went to FAULT at {format_absolute_time(ts)}",
+                                {"field": field, "time": ts},
+                                timestamp=ts)
                         elif prev_val < 0.5 and curr_val > 0.5:
                             self.add_anomaly("INFO", "HW_FAULT_RECOVERED",
-                                f"{field} recovered at t~{vals[i][0]:.1f}",
-                                {"field": field, "time": vals[i][0]})
+                                f"{field} recovered at {format_absolute_time(ts)}",
+                                {"field": field, "time": ts},
+                                timestamp=ts)
 
         # --- 8b: /device/odom_status — wheel encoder diagnostics ---
         if "/device/odom_status" in topic_map:
@@ -525,10 +624,12 @@ class DiagnosticAnalyzer:
                     prev_mean = prev_valid.get("mean", 0)
                     curr_mean = curr_valid.get("mean", 0)
                     if prev_mean > 50 and curr_mean < prev_mean * 0.3:
+                        ts = wstats[i]["window_start"]
                         self.add_anomaly("WARNING", "LIDAR_DEGRADATION",
                             f"{topic} point count dropped from {prev_mean:.0f} to "
-                            f"{curr_mean:.0f} at t~{wstats[i]['window_start']:.1f}",
-                            {"topic": topic, "time": wstats[i]["window_start"]})
+                            f"{curr_mean:.0f} at {format_absolute_time(ts)}",
+                            {"topic": topic, "time": ts},
+                            timestamp=ts)
 
             # Frequency check
             freq = self.bridge.check_topic_frequency(bag_path, topic, resolution=5.0)
@@ -538,10 +639,12 @@ class DiagnosticAnalyzer:
             for entry in series:
                 if mean_hz > 0 and entry["hz"] < mean_hz * 0.3:
                     if entry["time"] < end_time - 10:
+                        ts = entry["time"]
                         self.add_anomaly("CRITICAL", "LIDAR_FREQ_DROPOUT",
                             f"{topic} dropped to {entry['hz']:.1f}Hz "
-                            f"at t={entry['time']:.1f} (expected ~{mean_hz:.1f}Hz)",
-                            {"topic": topic, "time": entry["time"], "hz": entry["hz"]})
+                            f"at {format_absolute_time(ts)} (expected ~{mean_hz:.1f}Hz)",
+                            {"topic": topic, "time": ts, "hz": entry["hz"]},
+                            timestamp=ts)
 
     # ------------------------------------------------------------------
     # Phase 10: Scrubber Health
@@ -670,9 +773,11 @@ class DiagnosticAnalyzer:
             f"Bag: {bag_name}",
             f"Overall Health: {health}",
             f"Duration: {metadata['duration']:.1f}s",
+            f"Time: {format_absolute_time(metadata['start_time'])} to {format_absolute_time(metadata['end_time'])}",
             f"Critical Issues: {critical_count}",
             f"Warnings: {warning_count}",
             f"Info: {info_count}",
+            f"Log Events (WARN+): {len(self.log_events)}",
             "",
         ]
 
@@ -704,8 +809,13 @@ class DiagnosticAnalyzer:
                 "duration": metadata["duration"],
                 "num_topics": metadata["num_topics"],
                 "total_messages": metadata["total_messages"],
+                "start_time": metadata["start_time"],
+                "end_time": metadata["end_time"],
+                "start_time_str": format_absolute_time(metadata["start_time"]),
+                "end_time_str": format_absolute_time(metadata["end_time"]),
             },
             "anomalies": self.anomalies,
+            "log_events": self.log_events,
             "evidence": self.evidence,
             "diagnosis": diagnosis,
             "metrics": {
@@ -713,35 +823,452 @@ class DiagnosticAnalyzer:
                 "warning_count": warning_count,
                 "info_count": info_count,
                 "evidence_count": len(self.evidence),
+                "log_event_count": len(self.log_events),
             },
         }
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Run rule-based diagnostics on .bag files.")
-    default_bag_dir = PROJECT_ROOT
-    parser.add_argument(
-        "--bag-dir",
-        default=default_bag_dir,
-        help=f"Directory containing .bag files (default: {default_bag_dir})",
-    )
-    parser.add_argument(
-        "--report-path",
-        default=None,
-        help="Optional output path for diagnostic_report.json",
-    )
-    args = parser.parse_args()
-    bag_dir = os.path.abspath(args.bag_dir)
+# ======================================================================
+# MissionOrchestrator — multi-bag virtual timeline
+# ======================================================================
 
-    if not os.path.isdir(bag_dir):
-        print(f"Bag directory does not exist: {bag_dir}")
-        return
+@dataclass
+class BagInfo:
+    """Lightweight metadata for sorting/grouping bags."""
+    path: str
+    name: str
+    start_time: float
+    end_time: float
+    duration: float
 
-    bag_files = sorted([
-        f for f in os.listdir(bag_dir)
-        if f.endswith('.bag')
-    ])
 
+@dataclass
+class Mission:
+    """A group of temporally contiguous bags from one recording session."""
+    mission_id: int
+    bags: List[BagInfo]
+    start_time: float = 0.0
+    end_time: float = 0.0
+
+    def __post_init__(self):
+        if self.bags:
+            self.start_time = self.bags[0].start_time
+            self.end_time = self.bags[-1].end_time
+
+
+class MissionOrchestrator:
+    """Orchestrates multi-bag analysis with virtual timeline."""
+
+    def __init__(self, bag_dir: str, gap_threshold: float = MISSION_GAP_THRESHOLD):
+        self.bag_dir = bag_dir
+        self.gap_threshold = gap_threshold
+        self.bridge = ROSBagBridge()
+
+    def discover_and_group(self) -> List[Mission]:
+        """Discover bags, sort by time, group into missions."""
+        bag_files = sorted(f for f in os.listdir(self.bag_dir) if f.endswith('.bag'))
+        if not bag_files:
+            return []
+
+        # Collect metadata for all bags
+        bag_infos = []
+        for bf in bag_files:
+            path = os.path.join(self.bag_dir, bf)
+            try:
+                meta = self.bridge.get_bag_metadata(path)
+                bag_infos.append(BagInfo(
+                    path=path,
+                    name=bf,
+                    start_time=meta["start_time"],
+                    end_time=meta["end_time"],
+                    duration=meta["duration"],
+                ))
+            except Exception as e:
+                print(f"  [WARN] Could not read metadata for {bf}: {e}")
+                continue
+
+        if not bag_infos:
+            return []
+
+        # Sort by start_time
+        bag_infos.sort(key=lambda b: b.start_time)
+
+        # Group into missions based on time gaps
+        missions = []
+        current_group = [bag_infos[0]]
+
+        for i in range(1, len(bag_infos)):
+            prev_end = current_group[-1].end_time
+            curr_start = bag_infos[i].start_time
+            gap = curr_start - prev_end
+
+            if gap <= self.gap_threshold:
+                current_group.append(bag_infos[i])
+            else:
+                missions.append(Mission(
+                    mission_id=len(missions) + 1,
+                    bags=current_group,
+                ))
+                current_group = [bag_infos[i]]
+
+        # Don't forget the last group
+        missions.append(Mission(
+            mission_id=len(missions) + 1,
+            bags=current_group,
+        ))
+
+        return missions
+
+    def analyze_mission(self, mission: Mission) -> dict:
+        """Analyze all bags in a mission with cross-bag awareness."""
+        per_bag_reports = []
+        all_timeline_events = []
+
+        for bag_info in mission.bags:
+            analyzer = DiagnosticAnalyzer()
+            report = analyzer.analyze(bag_info.path)
+            per_bag_reports.append(report)
+
+            # Collect timeline events from anomalies
+            for anomaly in report["anomalies"]:
+                ts = anomaly.get("timestamp")
+                if ts is None:
+                    # Bag-wide anomalies: use bag start_time
+                    ts = bag_info.start_time
+                all_timeline_events.append({
+                    "timestamp": ts,
+                    "timestamp_str": format_absolute_time(ts),
+                    "bag": bag_info.name,
+                    "type": "anomaly",
+                    "severity": anomaly["severity"],
+                    "category": anomaly["category"],
+                    "description": anomaly["description"],
+                    "details": anomaly.get("details", {}),
+                })
+
+            # Collect log events
+            for log_ev in report.get("log_events", []):
+                all_timeline_events.append({
+                    "timestamp": log_ev["timestamp"],
+                    "timestamp_str": log_ev["timestamp_str"],
+                    "bag": bag_info.name,
+                    "type": "log",
+                    "severity": log_ev["level_str"],
+                    "category": f"LOG_{log_ev['level_str']}",
+                    "description": f"[{log_ev['node']}]: {log_ev['message']}",
+                    "details": {
+                        "node": log_ev["node"],
+                        "level": log_ev["level"],
+                    },
+                })
+
+        # Sort timeline by timestamp
+        all_timeline_events.sort(key=lambda e: e["timestamp"])
+
+        # Suppress boundary false positives
+        all_timeline_events = self._suppress_boundary_artifacts(
+            mission, all_timeline_events)
+
+        # Detect cross-bag anomalies
+        cross_bag_anomalies = self._detect_cross_bag_anomalies(
+            mission, per_bag_reports)
+
+        # Correlate logs with sensor anomalies
+        correlations = self._correlate_logs_and_anomalies(all_timeline_events)
+
+        # Compute overall mission health
+        overall_health = self._compute_mission_health(
+            per_bag_reports, cross_bag_anomalies)
+
+        return {
+            "mission_id": mission.mission_id,
+            "start_time": format_absolute_time(mission.start_time),
+            "end_time": format_absolute_time(mission.end_time),
+            "duration_sec": round(mission.end_time - mission.start_time, 1),
+            "num_bags": len(mission.bags),
+            "bags": [b.name for b in mission.bags],
+            "overall_health": overall_health,
+            "timeline": all_timeline_events,
+            "per_bag_summaries": [
+                {
+                    "bag_name": r["bag_name"],
+                    "health_status": r["health_status"],
+                    "duration": r["metadata"]["duration"],
+                    "start_time": r["metadata"].get("start_time_str", ""),
+                    "end_time": r["metadata"].get("end_time_str", ""),
+                    "critical_count": r["metrics"]["critical_count"],
+                    "warning_count": r["metrics"]["warning_count"],
+                    "log_event_count": r["metrics"].get("log_event_count", 0),
+                }
+                for r in per_bag_reports
+            ],
+            "cross_bag_anomalies": cross_bag_anomalies,
+            "correlations": correlations,
+        }
+
+    def _suppress_boundary_artifacts(self, mission: Mission,
+                                      events: list) -> list:
+        """Remove false frequency dropouts at bag boundaries."""
+        if len(mission.bags) < 2:
+            return events
+
+        BOUNDARY_MARGIN = 3.0  # seconds
+        boundary_windows = []
+
+        # Windows around each bag-to-bag boundary
+        for i in range(len(mission.bags) - 1):
+            boundary_time = mission.bags[i].end_time
+            boundary_windows.append(
+                (boundary_time - BOUNDARY_MARGIN,
+                 boundary_time + BOUNDARY_MARGIN))
+
+        # Also suppress at the very start/end of the mission
+        boundary_windows.append(
+            (mission.bags[0].start_time,
+             mission.bags[0].start_time + BOUNDARY_MARGIN))
+        boundary_windows.append(
+            (mission.bags[-1].end_time - BOUNDARY_MARGIN,
+             mission.bags[-1].end_time))
+
+        def is_in_boundary(ts):
+            for bw_start, bw_end in boundary_windows:
+                if bw_start <= ts <= bw_end:
+                    return True
+            return False
+
+        filtered = []
+        suppressed_count = 0
+        for event in events:
+            if (event["type"] == "anomaly" and
+                event["category"] in ("FREQUENCY_DROPOUT", "LIDAR_FREQ_DROPOUT") and
+                is_in_boundary(event["timestamp"])):
+                suppressed_count += 1
+                continue
+            filtered.append(event)
+
+        if suppressed_count > 0:
+            print(f"  [Boundary filter] Suppressed {suppressed_count} "
+                  f"frequency dropout(s) at bag boundaries")
+
+        return filtered
+
+    def _detect_cross_bag_anomalies(self, mission: Mission,
+                                     per_bag_reports: list) -> list:
+        """Detect anomalies that span bag boundaries."""
+        cross_bag = []
+
+        if len(per_bag_reports) < 2:
+            return cross_bag
+
+        for i in range(1, len(per_bag_reports)):
+            prev_report = per_bag_reports[i - 1]
+            curr_report = per_bag_reports[i]
+            prev_bag = mission.bags[i - 1].name
+            curr_bag = mission.bags[i].name
+
+            # --- Persistent frozen sensors ---
+            prev_frozen = {
+                (a["details"].get("topic"), a["details"].get("field"))
+                for a in prev_report["anomalies"]
+                if a["category"] in ("FROZEN_SENSOR", "FREEZE_ONSET")
+            }
+            curr_frozen = {
+                (a["details"].get("topic"), a["details"].get("field"))
+                for a in curr_report["anomalies"]
+                if a["category"] in ("FROZEN_SENSOR", "FREEZE_ONSET")
+            }
+
+            persistent = prev_frozen & curr_frozen
+            for topic, field_name in persistent:
+                if topic is None:
+                    continue
+
+                # Compare frozen values
+                prev_val = next(
+                    (a["details"].get("mean") for a in prev_report["anomalies"]
+                     if a["details"].get("topic") == topic and
+                     a["details"].get("field") == field_name),
+                    None)
+                curr_val = next(
+                    (a["details"].get("mean") for a in curr_report["anomalies"]
+                     if a["details"].get("topic") == topic and
+                     a["details"].get("field") == field_name),
+                    None)
+
+                same_value = True
+                if prev_val is not None and curr_val is not None:
+                    same_value = abs(prev_val - curr_val) < 1e-4
+
+                cross_bag.append({
+                    "type": "PERSISTENT_FREEZE",
+                    "severity": "CRITICAL",
+                    "description": (
+                        f"{topic}.{field_name} frozen across bag boundary "
+                        f"({prev_bag} -> {curr_bag})"
+                        + (f", same value={prev_val:.6f}" if same_value and prev_val is not None else "")
+                    ),
+                    "bags": [prev_bag, curr_bag],
+                    "topic": topic,
+                    "field": field_name,
+                    "same_value": same_value,
+                })
+
+            # --- Persistent hardware faults ---
+            prev_hw = {
+                a["details"].get("field")
+                for a in prev_report["anomalies"]
+                if a["category"] in ("HW_FAULT", "HW_FAULT_ONSET")
+            }
+            curr_hw = {
+                a["details"].get("field")
+                for a in curr_report["anomalies"]
+                if a["category"] in ("HW_FAULT", "HW_FAULT_ONSET")
+            }
+
+            persistent_hw = prev_hw & curr_hw
+            for hw_field in persistent_hw:
+                if hw_field is None:
+                    continue
+                cross_bag.append({
+                    "type": "PERSISTENT_HW_FAULT",
+                    "severity": "CRITICAL",
+                    "description": (
+                        f"Hardware fault '{hw_field}' persists across "
+                        f"{prev_bag} -> {curr_bag}"
+                    ),
+                    "bags": [prev_bag, curr_bag],
+                    "field": hw_field,
+                })
+
+            # --- Cross-bag recovery ---
+            prev_not_curr = prev_frozen - curr_frozen
+            for topic, field_name in prev_not_curr:
+                if topic is None:
+                    continue
+                has_resume = any(
+                    a["category"] == "SENSOR_RESUME" and
+                    a["details"].get("topic") == topic and
+                    a["details"].get("field") == field_name
+                    for a in curr_report["anomalies"]
+                )
+                if has_resume:
+                    cross_bag.append({
+                        "type": "CROSS_BAG_RECOVERY",
+                        "severity": "INFO",
+                        "description": (
+                            f"{topic}.{field_name} frozen in {prev_bag}, "
+                            f"resumed in {curr_bag}"
+                        ),
+                        "bags": [prev_bag, curr_bag],
+                        "topic": topic,
+                        "field": field_name,
+                    })
+
+        return cross_bag
+
+    def _correlate_logs_and_anomalies(self, timeline_events: list,
+                                       window_sec: float = 2.0) -> list:
+        """Find temporal correlations between log events and sensor anomalies.
+
+        Two-pointer sweep for O(N+M) efficiency over sorted lists.
+        """
+        logs = [e for e in timeline_events if e["type"] == "log"]
+        anomalies = [e for e in timeline_events if e["type"] == "anomaly"]
+
+        if not logs or not anomalies:
+            return []
+
+        correlations = []
+        log_idx = 0
+
+        for anomaly in anomalies:
+            a_ts = anomaly["timestamp"]
+            matched_logs = []
+
+            # Rewind if needed
+            while log_idx > 0 and logs[log_idx]["timestamp"] > a_ts - window_sec:
+                log_idx -= 1
+
+            # Scan forward through logs within the window
+            j = log_idx
+            while j < len(logs):
+                l_ts = logs[j]["timestamp"]
+                if l_ts > a_ts + window_sec:
+                    break
+                if l_ts >= a_ts - window_sec:
+                    matched_logs.append({
+                        "log_timestamp": logs[j]["timestamp_str"],
+                        "log_node": logs[j].get("details", {}).get("node", ""),
+                        "log_message": logs[j]["description"],
+                        "time_delta_sec": round(l_ts - a_ts, 3),
+                    })
+                j += 1
+
+            if matched_logs:
+                correlations.append({
+                    "anomaly_timestamp": anomaly["timestamp_str"],
+                    "anomaly_category": anomaly["category"],
+                    "anomaly_description": anomaly["description"],
+                    "anomaly_bag": anomaly["bag"],
+                    "correlated_logs": matched_logs,
+                })
+
+        return correlations
+
+    def _compute_mission_health(self, per_bag_reports: list,
+                                 cross_bag_anomalies: list) -> str:
+        """Compute overall mission health."""
+        total_critical = sum(r["metrics"]["critical_count"] for r in per_bag_reports)
+        total_warnings = sum(r["metrics"]["warning_count"] for r in per_bag_reports)
+        cross_critical = sum(1 for a in cross_bag_anomalies
+                            if a.get("severity") == "CRITICAL")
+
+        if total_critical > 0 or cross_critical > 0:
+            return "UNHEALTHY"
+        elif total_warnings > 5:
+            return "DEGRADED"
+        elif total_warnings > 0:
+            return "MARGINAL"
+        else:
+            return "HEALTHY"
+
+
+# ======================================================================
+# CSV Export
+# ======================================================================
+
+def export_timeline_csv(mission_report: dict, output_path: str):
+    """Export the timeline from a mission report to CSV."""
+    fieldnames = ["timestamp", "bag", "type", "severity", "category",
+                  "description", "details"]
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames,
+                                extrasaction="ignore")
+        writer.writeheader()
+
+        for event in mission_report.get("timeline", []):
+            row = {
+                "timestamp": event.get("timestamp_str", ""),
+                "bag": event.get("bag", ""),
+                "type": event.get("type", ""),
+                "severity": event.get("severity", ""),
+                "category": event.get("category", ""),
+                "description": event.get("description", ""),
+                "details": json.dumps(event.get("details", {})),
+            }
+            writer.writerow(row)
+
+    print(f"CSV timeline exported to: {output_path}")
+
+
+# ======================================================================
+# CLI Entry Points
+# ======================================================================
+
+def _run_legacy_mode(bag_dir: str, report_path: str = None):
+    """Original per-bag analysis — backward compatible."""
+    bag_files = sorted(f for f in os.listdir(bag_dir) if f.endswith('.bag'))
     if not bag_files:
         print("No .bag files found!")
         return
@@ -753,8 +1280,7 @@ def main():
         report = analyzer.analyze(bag_path)
         all_reports.append(report)
 
-    # Save comprehensive report
-    report_path = args.report_path or os.path.join(
+    report_path = report_path or os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         "diagnostic_report.json",
     )
@@ -772,6 +1298,130 @@ def main():
         print(f"    Critical: {r['metrics']['critical_count']}")
         print(f"    Warnings: {r['metrics']['warning_count']}")
         print(f"    Evidence: {r['metrics']['evidence_count']} items")
+
+
+def _run_mission_mode(bag_dir: str, report_path: str = None,
+                      csv_path: str = None, gap_threshold: float = 300.0):
+    """Mission-centric multi-bag analysis with virtual timeline."""
+    orchestrator = MissionOrchestrator(bag_dir, gap_threshold=gap_threshold)
+
+    # Phase A: Discover and group
+    print(f"\n{'='*70}")
+    print("MISSION DISCOVERY")
+    print(f"{'='*70}")
+    missions = orchestrator.discover_and_group()
+
+    if not missions:
+        print("No bag files found or all unreadable!")
+        return
+
+    for mission in missions:
+        print(f"\n  Mission {mission.mission_id}:")
+        print(f"    Time range: {format_absolute_time(mission.start_time)} to "
+              f"{format_absolute_time(mission.end_time)}")
+        print(f"    Duration: {mission.end_time - mission.start_time:.1f}s")
+        print(f"    Bags: {len(mission.bags)}")
+        for bag in mission.bags:
+            print(f"      - {bag.name} ({bag.duration:.1f}s)")
+
+    # Phase B: Analyze each mission
+    mission_reports = []
+    for mission in missions:
+        print(f"\n{'='*70}")
+        print(f"ANALYZING MISSION {mission.mission_id} "
+              f"({len(mission.bags)} bags)")
+        print(f"{'='*70}")
+        report = orchestrator.analyze_mission(mission)
+        mission_reports.append(report)
+
+    # Phase C: Output
+    full_report = {
+        "analyzer_version": "2.0",
+        "analysis_mode": "mission",
+        "generated_at": format_absolute_time(time.time()),
+        "missions": mission_reports,
+    }
+
+    report_path = report_path or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "diagnostic_report.json",
+    )
+    with open(report_path, "w") as f:
+        json.dump(full_report, f, indent=2, default=str)
+    print(f"\n\nMission report saved to: {report_path}")
+
+    # CSV export if requested
+    if csv_path:
+        for mr in mission_reports:
+            if len(mission_reports) > 1:
+                base, ext = os.path.splitext(csv_path)
+                path = f"{base}_mission{mr['mission_id']}{ext}"
+            else:
+                path = csv_path
+            export_timeline_csv(mr, path)
+
+    # Print mission summaries
+    print(f"\n{'='*70}")
+    print("MISSION SUMMARIES")
+    print(f"{'='*70}")
+    for mr in mission_reports:
+        print(f"\n  Mission {mr['mission_id']}: {mr['overall_health']}")
+        print(f"    Time: {mr['start_time']} to {mr['end_time']}")
+        print(f"    Duration: {mr['duration_sec']:.1f}s")
+        print(f"    Bags: {mr['num_bags']}")
+        print(f"    Timeline events: {len(mr['timeline'])}")
+        print(f"    Cross-bag anomalies: {len(mr['cross_bag_anomalies'])}")
+        print(f"    Log-sensor correlations: {len(mr['correlations'])}")
+        for s in mr["per_bag_summaries"]:
+            print(f"      {s['bag_name']}: {s['health_status']} "
+                  f"(C:{s['critical_count']} W:{s['warning_count']} "
+                  f"L:{s['log_event_count']})")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run rule-based diagnostics on .bag files.")
+    default_bag_dir = PROJECT_ROOT
+    parser.add_argument(
+        "--bag-dir",
+        default=default_bag_dir,
+        help=f"Directory containing .bag files (default: {default_bag_dir})",
+    )
+    parser.add_argument(
+        "--report-path",
+        default=None,
+        help="Output path for diagnostic report JSON",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["legacy", "mission"],
+        default="mission",
+        help="Analysis mode: 'legacy' for per-bag (backward compat), "
+             "'mission' for multi-bag virtual timeline (default: mission)",
+    )
+    parser.add_argument(
+        "--csv",
+        default=None,
+        help="Path for CSV timeline export (mission mode only)",
+    )
+    parser.add_argument(
+        "--gap-threshold",
+        type=float,
+        default=300.0,
+        help="Max seconds between bags to group into same mission (default: 300)",
+    )
+    args = parser.parse_args()
+    bag_dir = os.path.abspath(args.bag_dir)
+
+    if not os.path.isdir(bag_dir):
+        print(f"Bag directory does not exist: {bag_dir}")
+        return
+
+    if args.mode == "legacy":
+        _run_legacy_mode(bag_dir, args.report_path)
+    else:
+        _run_mission_mode(bag_dir, args.report_path, args.csv,
+                         args.gap_threshold)
 
 
 if __name__ == "__main__":

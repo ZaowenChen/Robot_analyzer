@@ -264,7 +264,7 @@ class TruncatedBagReader:
                                         topic=rec_topic,
                                         msgtype=normalized_type,
                                         msgdef=rec_msgdef or '',
-                                        digest=rec_md5 or '',
+                                        md5sum=rec_md5 or '',
                                         msgcount=0,
                                         ext=ext,
                                         owner=None,
@@ -304,7 +304,7 @@ class TruncatedBagReader:
                 topic=conn.topic,
                 msgtype=conn.msgtype,
                 msgdef=conn.msgdef,
-                digest=conn.digest,
+                md5sum=conn.md5sum,
                 msgcount=count,
                 ext=conn.ext,
                 owner=None,
@@ -655,6 +655,27 @@ def _extract_diagnostic_status(msg) -> Dict[str, float]:
 
 
 FIELD_EXTRACTORS["diagnostic_msgs/msg/DiagnosticStatus"] = _extract_diagnostic_status
+
+
+# ---------- /rosout log message support ----------
+
+LOG_LEVELS = {1: "DEBUG", 2: "INFO", 4: "WARN", 8: "ERROR", 16: "FATAL"}
+
+
+def _extract_log_message(msg) -> dict:
+    """Extract structured data from a rosgraph_msgs/msg/Log message.
+
+    Unlike FIELD_EXTRACTORS (which return only numeric scalars for Welford),
+    this returns both numeric and string fields for log analysis.
+    """
+    return {
+        "level": int(msg.level),
+        "name": str(getattr(msg, 'name', '')),
+        "msg": str(getattr(msg, 'msg', '')),
+        "file": str(getattr(msg, 'file', '')),
+        "function": str(getattr(msg, 'function', '')),
+        "line": int(getattr(msg, 'line', 0)),
+    }
 
 
 def extract_fields(msg, msgtype: str) -> Optional[Dict[str, float]]:
