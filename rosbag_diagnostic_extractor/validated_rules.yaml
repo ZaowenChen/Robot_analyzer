@@ -1,0 +1,26 @@
+# Validated causal rules for the diagnostic extractor.
+#
+# Rules are added ONLY after validation against real failure cases:
+#   1. Run the extractor on 20-30 real failure logs
+#   2. Compare data-driven chains against team's confirmed diagnoses
+#   3. Chains that consistently match reality become rules here
+#
+# Rules BOOST chain confidence, they don't OVERRIDE data-driven findings.
+# If a rule contradicts the data (rule says A->B but they never co-occur),
+# a WARNING is generated in the report.
+#
+# Format:
+#   - name: human-readable rule name
+#     root: (node, template_pattern) of the root cause
+#     downstream: list of (node, template_pattern) downstream effects
+#     confidence: how much to boost chain confidence (0.0-1.0)
+#
+# Example (DO NOT ADD until validated):
+#   - name: "depth_camera_cascade"
+#     root: ["/dl_infer", "overdark"]
+#     downstream:
+#       - ["/depthcam_fusion", "Tf tranform failed"]
+#       - ["/homo_fusion_tracker_node", "localization_status  #"]
+#     confidence: 0.8
+
+rules: []

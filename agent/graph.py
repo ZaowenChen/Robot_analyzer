@@ -28,14 +28,9 @@ from langchain_core.messages import (
 
 from langgraph.graph import END, StateGraph
 
-try:
-    from .prompt_templates import SYSTEM_PROMPT, CRITIC_PROMPT
-    from .rosbag_bridge import ROSBagBridge
-    from .tools import ALL_TOOLS
-except ImportError:
-    from prompt_templates import SYSTEM_PROMPT, CRITIC_PROMPT
-    from rosbag_bridge import ROSBagBridge
-    from tools import ALL_TOOLS
+from agent.prompts import SYSTEM_PROMPT, CRITIC_PROMPT
+from bridge import ROSBagBridge
+from agent.tools import ALL_TOOLS
 
 
 # ---------------------------------------------------------------------------

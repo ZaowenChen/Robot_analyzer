@@ -29,6 +29,17 @@ Thumbs.db
 # Generated reports (re-run to regenerate)
 rosbag_analyzer/diagnostic_report.json
 rosbag_analyzer/validation_report.json
+cross_validation_report.json
+cross_validation_test.json
+diagnostic_report.json
+validation_report.json
+report.html
+timeline.csv
+diagnostics_output/
+foxglove_layouts/
+
+# Claude Code
+.claude/
 
 # Environment
 .env

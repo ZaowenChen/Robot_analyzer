@@ -1,10 +1,9 @@
-#!/usr/bin/env python3
 """
 Enhanced ROSBag Profiler & Anomaly Slicer
 
 Runs two complementary passes on every bag:
-  Pass 1 – Log & Diagnostic scan  (/rosout, DiagnosticStatus)
-  Pass 2 – Sensor-data analysis   (frozen fields, frequency drops,
+  Pass 1 -- Log & Diagnostic scan  (/rosout, DiagnosticStatus)
+  Pass 2 -- Sensor-data analysis   (frozen fields, frequency drops,
             cmd/odom mismatch) via the ROSBagBridge statistical tools.
 
 Pass 2 runs regardless of whether Pass 1 found anything, so *silent*
@@ -12,6 +11,10 @@ failures (frozen sensors without any WARN/ERROR log) are caught.
 
 Batch mode (--batch-dir) scans an entire folder of bags and prints a
 single summary table so you can spot the problematic files at a glance.
+
+Usage:
+  python -m cli.profiler <bag_path>
+  python -m cli.profiler --batch-dir ./bags
 """
 
 import argparse
@@ -23,56 +26,21 @@ import sys
 from collections import defaultdict
 
 from rosbags.serde import deserialize_cdr, ros1_to_cdr
-from rosbag_bridge import open_bag, msg_to_dict, ROSBagBridge
+from bridge import open_bag, msg_to_dict, ROSBagBridge
 
-LOG_LEVELS = {1: "DEBUG", 2: "INFO", 4: "WARN", 8: "ERROR", 16: "FATAL"}
-DIAG_LEVELS = {0: "OK", 1: "WARN", 2: "ERROR", 3: "STALE"}
-
-# Fields that are legitimately zero on a 2-D differential-drive robot
-EXPECTED_ZERO_FIELDS = {
-    "/odom": {"orientation_x", "orientation_y", "position_z",
-              "twist_angular_x", "twist_angular_y",
-              "twist_linear_y", "twist_linear_z"},
-    "/chassis_cmd_vel": {"angular_x", "angular_y", "linear_y", "linear_z"},
-    "/cmd_vel": {"angular_x", "angular_y", "linear_y", "linear_z"},
-    "/device/health_status": {"level"},
-    "/device/odom_status": {"level", "unicycle_angle_offset"},
-    "/device/imu_data": {"level", "stamp_sec", "stamp_nsec"},
-    "/device/scrubber_status": {"level"},
-    "/device/scrubber_motor_limit": {"level"},
-}
-
-# Topics worth checking for sensor-level anomalies
-KEY_SENSOR_TOPICS = [
-    "/odom", "/chassis_cmd_vel", "/cmd_vel",
-    "/unbiased_imu_PRY", "/localization/current_pose",
-]
-
-# Hardware topics (DiagnosticStatus-based and other hardware indicators)
-HARDWARE_TOPICS = [
-    "/device/health_status",
-    "/device/odom_status",
-    "/device/imu_data",
-    "/device/scrubber_status",
-    "/device/scrubber_motor_limit",
-    "/raw_scan", "/scan_rear",
-    "/ir_sticker3", "/ir_sticker6", "/ir_sticker7",
-    "/protector",
-    "/localization/status", "/navigation/status",
-]
-
-# Boolean health flags in /device/health_status where false (0.0) = fault
-HEALTH_FLAG_NAMES = {
-    "rear_rolling_brush_motor", "front_rolling_brush_motor",
-    "imu_board", "ultrasonic_board", "motor_driver",
-    "battery_disconnection", "mcu_disconnection", "mcu_delay",
-    "laser_disconnection", "router_disconnection", "tablet_disconnection",
-    "odom_left_delta", "odom_right_delta", "odom_delta_speed", "odom_track_delta",
-    "motor_driver_emergency", "imu_roll_pitch_abnormal", "imu_overturn",
-}
+# Import constants from core (previously duplicated in this file)
+from core.utils import LOG_LEVELS
+from core.constants import (
+    DIAG_LEVELS,
+    EXPECTED_ZERO_FIELDS,
+    KEY_SENSOR_TOPICS,
+    HARDWARE_TOPICS,
+    HEALTH_FLAG_NAMES,
+)
 
 
 def format_time(ts_sec):
+    """Format a Unix timestamp as HH:MM:SS.mmm (local helper)."""
     return datetime.datetime.fromtimestamp(ts_sec).strftime('%H:%M:%S.%f')[:-3]
 
 
@@ -101,7 +69,7 @@ def profile_and_slice_bag(bag_path, bridge=None):
 
     try:
         # ==============================================================
-        # STEP 1 – Metadata
+        # STEP 1 -- Metadata
         # ==============================================================
         metadata = bridge.get_bag_metadata(bag_path)
         duration = metadata["duration"]
@@ -118,7 +86,7 @@ def profile_and_slice_bag(bag_path, bridge=None):
         topic_map = {t["name"]: t for t in metadata["topics"]}
 
         # ==============================================================
-        # STEP 2 – Log & hardware diagnostic scan  (original Pass 1)
+        # STEP 2 -- Log & hardware diagnostic scan  (original Pass 1)
         # ==============================================================
         print(f"\n[2] SCANNING LOGS & HARDWARE DIAGNOSTICS...")
 
@@ -172,7 +140,7 @@ def profile_and_slice_bag(bag_path, bridge=None):
                 print(f"    ... and {len(abnormal_events)-8} more")
 
         # ==============================================================
-        # STEP 3 – Sensor-data anomaly detection  (NEW)
+        # STEP 3 -- Sensor-data anomaly detection
         # ==============================================================
         print(f"\n[3] SENSOR DATA ANALYSIS (frozen fields, frequency, cmd/odom)...")
 
@@ -374,7 +342,7 @@ def profile_and_slice_bag(bag_path, bridge=None):
             print("  No sensor-data anomalies detected.")
 
         # ==============================================================
-        # STEP 4 – Context Slicer  (original Pass 2 — runs if anomalies)
+        # STEP 4 -- Context Slicer  (runs if anomalies found)
         # ==============================================================
         all_anomaly_times = [ev[0] for ev in abnormal_events]
         for a in sensor_anomalies:
@@ -445,7 +413,7 @@ def profile_and_slice_bag(bag_path, bridge=None):
                 print("-" * 80)
 
         # ==============================================================
-        # STEP 5 – Health verdict
+        # STEP 5 -- Health verdict
         # ==============================================================
         critical_types = {"FROZEN_SENSOR", "CMD_ODOM_MISMATCH", "FREQ_DROPOUT",
                           "HW_FAULT", "LIDAR_POINT_DROP"}
@@ -493,7 +461,7 @@ def batch_scan(bag_dir, report_path=None):
 
     print(f"Found {len(bag_files)} bag(s) in {bag_dir}\n")
 
-    bridge = ROSBagBridge()          # single bridge instance → reader cache
+    bridge = ROSBagBridge()          # single bridge instance for reader cache
     results = []
 
     for bag_file in bag_files:
@@ -545,7 +513,7 @@ def batch_scan(bag_dir, report_path=None):
 # -----------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(
         description="Profile ROS bags for log anomalies AND sensor-data issues.")
     parser.add_argument(
@@ -565,3 +533,7 @@ if __name__ == "__main__":
         profile_and_slice_bag(args.bag_path)
     else:
         parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

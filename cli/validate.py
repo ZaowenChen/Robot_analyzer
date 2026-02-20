@@ -1,5 +1,5 @@
 """
-Validation Script - Run the diagnostic agent against rosbag files.
+Validation Script -- Run the diagnostic agent against rosbag files.
 
 This script:
 1. Runs the Bridge tools directly to characterize each bag
@@ -9,23 +9,25 @@ This script:
 Can run in two modes:
 - bridge_only: Just run the bridge tools to validate they work (no LLM needed)
 - full: Run the complete LangGraph agent (requires API key)
+
+Usage:
+  python -m cli.validate bridge_only
+  python -m cli.validate full
 """
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
 
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(THIS_DIR) if os.path.basename(THIS_DIR) == "rosbag_analyzer" else THIS_DIR
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+from bridge import ROSBagBridge
+from analysis.diagnostic_analyzer import DiagnosticAnalyzer
+from agent.graph import run_diagnostic
 
-try:
-    from rosbag_analyzer.rosbag_bridge import ROSBagBridge
-except ModuleNotFoundError:
-    from rosbag_bridge import ROSBagBridge
+# Project root: one level up from the cli/ directory
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def run_bridge_validation(bag_path: str, bag_name: str) -> dict:
@@ -264,7 +266,7 @@ You are a strict Fact-Checker for robotic diagnostic reports.
 
 You are given:
 1. A DIAGNOSIS produced by a diagnostic agent.
-2. An EVIDENCE LOCKER – a list of factual observations extracted by
+2. An EVIDENCE LOCKER -- a list of factual observations extracted by
    programmatic tools from a ROS bag.
 
 Your task:
@@ -274,7 +276,7 @@ Your task:
 - For each claim, determine whether it is SUPPORTED or UNSUPPORTED by the
   evidence locker.  A claim is SUPPORTED only if there is a matching or
   clearly entailed item in the evidence.
-- Respond with EXACTLY this JSON format – no commentary before or after:
+- Respond with EXACTLY this JSON format -- no commentary before or after:
 
 {{
   "claims": [
@@ -333,7 +335,6 @@ def compute_hallucination_rate(
     ])
 
     # Parse the JSON response
-    import re
     text = response.content if hasattr(response, "content") else str(response)
 
     # Try to extract JSON from the response
@@ -370,19 +371,10 @@ def run_full_agent_validation(bag_path: str, bag_name: str) -> dict:
         print(f"NOTE: No LLM API key found (ANTHROPIC_API_KEY / OPENAI_API_KEY).")
         print(f"Falling back to rule-based DiagnosticAnalyzer for: {bag_name}")
         print(f"{'='*70}")
-        try:
-            from rosbag_analyzer.analyze import DiagnosticAnalyzer
-        except ModuleNotFoundError:
-            from analyze import DiagnosticAnalyzer
 
         analyzer = DiagnosticAnalyzer()
         report = analyzer.analyze(bag_path)
         return report
-
-    try:
-        from rosbag_analyzer.agent import run_diagnostic
-    except ModuleNotFoundError:
-        from agent import run_diagnostic
 
     print(f"\n{'='*70}")
     print(f"AGENT VALIDATION: {bag_name}")
@@ -477,7 +469,7 @@ def main():
             all_reports.append(agent_report)
 
     # Save reports
-    report_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation_report.json")
+    report_path = os.path.join(PROJECT_ROOT, "validation_report.json")
     with open(report_path, "w") as f:
         json.dump(all_reports, f, indent=2, default=str)
     print(f"\n\nReport saved to: {report_path}")
